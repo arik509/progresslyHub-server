@@ -41,60 +41,96 @@ app.use(
       "https://progressly-hub-client.vercel.app"
     ],
     credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
 app.use(express.json());
 
-// -------------------- MongoDB Connection (Serverless Optimized) --------------------
-let cachedClient = null;
-let cachedDb = null;
+// -------------------- MongoDB Connection (Optimized for Serverless) --------------------
+let mongoClient = null;
+let db = null;
 
-async function connectToDatabase() {
-  if (cachedClient && cachedDb) {
-    return {
-      client: cachedClient,
-      db: cachedDb,
-      offices: cachedDb.collection("offices"),
-      memberships: cachedDb.collection("memberships"),
-      users: cachedDb.collection("users"),
-      projects: cachedDb.collection("projects"),
-      tasks: cachedDb.collection("tasks"),
-    };
+async function connectMongo() {
+  // Reuse existing connection if available
+  if (db && mongoClient) {
+    try {
+      await mongoClient.db("admin").command({ ping: 1 });
+      return db;
+    } catch (e) {
+      console.log("Connection lost, reconnecting...");
+      db = null;
+      mongoClient = null;
+    }
   }
 
   const uri = process.env.MONGO_URI;
-  if (!uri) throw new Error("MONGO_URI is missing in environment variables");
+  if (!uri) throw new Error("MONGO_URI is missing in .env");
 
-  const client = new MongoClient(uri, {
+  mongoClient = new MongoClient(uri, {
     serverApi: {
       version: ServerApiVersion.v1,
       strict: true,
       deprecationErrors: true,
     },
+    maxPoolSize: 10,
+    minPoolSize: 1,
+    maxIdleTimeMS: 60000,
   });
 
-  await client.connect();
+  await mongoClient.connect();
   console.log("✅ Connected to MongoDB!");
 
-  const db = client.db(process.env.MONGO_DB_NAME || "progresslyhub");
+  db = mongoClient.db(process.env.MONGO_DB_NAME || "progresslyhub");
 
-  cachedClient = client;
-  cachedDb = db;
+  // Only ensure indexes once
+  if (!db._indexesEnsured) {
+    await ensureIndexes();
+    db._indexesEnsured = true;
+  }
 
+  return db;
+}
+
+function getDB() {
+  if (!db) throw new Error("Database not connected");
+  return db;
+}
+
+function cols() {
+  const database = getDB();
   return {
-    client,
-    db,
-    offices: db.collection("offices"),
-    memberships: db.collection("memberships"),
-    users: db.collection("users"),
-    projects: db.collection("projects"),
-    tasks: db.collection("tasks"),
+    offices: database.collection("offices"),
+    memberships: database.collection("memberships"),
+    users: database.collection("users"),
   };
 }
 
 function now() {
   return new Date();
+}
+
+async function ensureIndexes() {
+  const { offices, memberships, users } = cols();
+  const db = getDB();
+
+  await offices.createIndex({ createdByUid: 1 });
+  await memberships.createIndex({ userUid: 1 });
+  await memberships.createIndex({ officeId: 1, userUid: 1 }, { unique: true });
+  await users.createIndex({ uid: 1 }, { unique: true });
+  await users.createIndex({ email: 1 });
+
+  const projects = db.collection("projects");
+  await projects.createIndex({ officeId: 1 });
+  await projects.createIndex({ createdByUid: 1 });
+
+  const tasks = db.collection("tasks");
+  await tasks.createIndex({ officeId: 1 });
+  await tasks.createIndex({ createdByUid: 1 });
+  await tasks.createIndex({ assignedTo: 1 });
+
+  console.log("✅ All indexes created successfully");
 }
 
 // -------------------- Auth Middleware --------------------
@@ -150,8 +186,9 @@ app.get("/api/me", verifyFirebaseToken, (req, res) => {
 
 app.get("/api/db-test", async (req, res) => {
   try {
-    const { db } = await connectToDatabase();
-    const collections = await db.listCollections().toArray();
+    await connectMongo();
+    const database = getDB();
+    const collections = await database.listCollections().toArray();
     res.json({ ok: true, collections: collections.map((c) => c.name) });
   } catch (e) {
     res.status(500).json({ ok: false, message: e.message });
@@ -161,7 +198,8 @@ app.get("/api/db-test", async (req, res) => {
 // -------------------- Office Routes --------------------
 app.post("/api/offices", verifyFirebaseToken, async (req, res) => {
   try {
-    const { offices, memberships, users } = await connectToDatabase();
+    await connectMongo();
+    const { offices, memberships, users } = cols();
     const { name } = req.body;
 
     if (!name || name.trim().length < 2) {
@@ -216,7 +254,8 @@ app.post("/api/offices", verifyFirebaseToken, async (req, res) => {
 
 app.get("/api/offices/my", verifyFirebaseToken, async (req, res) => {
   try {
-    const { offices, memberships } = await connectToDatabase();
+    await connectMongo();
+    const { offices, memberships } = cols();
     const uid = req.firebase.uid;
 
     const myMemberships = await memberships.find({ userUid: uid }).toArray();
@@ -240,7 +279,8 @@ app.post(
   requireRole(["CEO", "ADMIN", "MANAGER"]),
   async (req, res) => {
     try {
-      const { memberships, users } = await connectToDatabase();
+      await connectMongo();
+      const { memberships, users } = cols();
       const { officeId } = req.params;
       const { email, role } = req.body;
 
@@ -303,7 +343,8 @@ app.get(
   requireRole(["CEO", "ADMIN", "MANAGER"]),
   async (req, res) => {
     try {
-      const { memberships } = await connectToDatabase();
+      await connectMongo();
+      const { memberships } = cols();
       const { officeId } = req.params;
 
       const officeObjectId = new ObjectId(officeId);
@@ -327,7 +368,7 @@ app.post(
   requireRole(["CEO", "ADMIN", "MANAGER"]),
   async (req, res) => {
     try {
-      const { projects } = await connectToDatabase();
+      await connectMongo();
       const { officeId } = req.params;
       const { name, description, status } = req.body;
 
@@ -335,6 +376,8 @@ app.post(
         return res.status(400).json({ message: "Project name is required" });
 
       const officeObjectId = new ObjectId(officeId);
+      const db = getDB();
+      const projects = db.collection("projects");
 
       const doc = {
         officeId: officeObjectId,
@@ -362,9 +405,12 @@ app.get(
   verifyFirebaseToken,
   async (req, res) => {
     try {
-      const { projects } = await connectToDatabase();
+      await connectMongo();
       const { officeId } = req.params;
       const officeObjectId = new ObjectId(officeId);
+
+      const db = getDB();
+      const projects = db.collection("projects");
 
       const list = await projects
         .find({ officeId: officeObjectId })
@@ -383,9 +429,12 @@ app.put(
   requireRole(["CEO", "ADMIN", "MANAGER"]),
   async (req, res) => {
     try {
-      const { projects } = await connectToDatabase();
+      await connectMongo();
       const { projectId } = req.params;
       const { name, description, status } = req.body;
+
+      const db = getDB();
+      const projects = db.collection("projects");
 
       const update = { updatedAt: now() };
       if (name) update.name = name.trim();
@@ -414,8 +463,11 @@ app.delete(
   requireRole(["CEO", "ADMIN", "MANAGER"]),
   async (req, res) => {
     try {
-      const { projects } = await connectToDatabase();
+      await connectMongo();
       const { projectId } = req.params;
+
+      const db = getDB();
+      const projects = db.collection("projects");
 
       const result = await projects.deleteOne({ _id: new ObjectId(projectId) });
 
@@ -437,7 +489,7 @@ app.post(
   requireRole(["CEO", "ADMIN", "MANAGER"]),
   async (req, res) => {
     try {
-      const { tasks } = await connectToDatabase();
+      await connectMongo();
       const { officeId } = req.params;
       const { title, description, status, priority, assignedTo } = req.body;
 
@@ -445,6 +497,8 @@ app.post(
         return res.status(400).json({ message: "Task title is required" });
 
       const officeObjectId = new ObjectId(officeId);
+      const db = getDB();
+      const tasks = db.collection("tasks");
 
       const doc = {
         officeId: officeObjectId,
@@ -474,9 +528,12 @@ app.get(
   verifyFirebaseToken,
   async (req, res) => {
     try {
-      const { tasks } = await connectToDatabase();
+      await connectMongo();
       const { officeId } = req.params;
       const officeObjectId = new ObjectId(officeId);
+
+      const db = getDB();
+      const tasks = db.collection("tasks");
 
       const list = await tasks
         .find({ officeId: officeObjectId })
@@ -494,9 +551,12 @@ app.put(
   verifyFirebaseToken,
   async (req, res) => {
     try {
-      const { tasks } = await connectToDatabase();
+      await connectMongo();
       const { taskId } = req.params;
       const { title, description, status, priority, assignedTo } = req.body;
+
+      const db = getDB();
+      const tasks = db.collection("tasks");
 
       const task = await tasks.findOne({ _id: new ObjectId(taskId) });
 
@@ -555,8 +615,11 @@ app.delete(
   requireRole(["CEO", "ADMIN", "MANAGER"]),
   async (req, res) => {
     try {
-      const { tasks } = await connectToDatabase();
+      await connectMongo();
       const { taskId } = req.params;
+
+      const db = getDB();
+      const tasks = db.collection("tasks");
 
       const result = await tasks.deleteOne({ _id: new ObjectId(taskId) });
 
@@ -573,9 +636,16 @@ app.delete(
 
 // -------------------- Start Server --------------------
 if (process.env.NODE_ENV !== "production") {
-  app.listen(port, () => {
-    console.log(`Server is running on port ${port}`);
+  async function start() {
+    await connectMongo();
+    app.listen(port, () => console.log(`Server listening on port ${port}`));
+  }
+
+  start().catch((err) => {
+    console.error("Failed to start server:", err);
+    process.exit(1);
   });
 }
 
+// VERCEL SERVERLESS EXPORT
 module.exports = app;
