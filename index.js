@@ -16,13 +16,28 @@ app.use(cors());
 app.use(express.json());
 
 // -------------------- Firebase Admin Init --------------------
-const serviceAccountPath =
-  process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "./serviceAccountKey.json";
-const serviceAccount = JSON.parse(fs.readFileSync(serviceAccountPath, "utf8"));
+let serviceAccount;
+
+if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
+  // PRODUCTION (Vercel): Decode from base64 environment variable
+  console.log("Loading Firebase credentials from environment variable");
+  const decoded = Buffer.from(
+    process.env.FIREBASE_SERVICE_ACCOUNT_BASE64,
+    'base64'
+  ).toString('utf8');
+  serviceAccount = JSON.parse(decoded);
+} else {
+  // LOCAL DEVELOPMENT: Read from file
+  console.log("Loading Firebase credentials from file");
+  const serviceAccountPath =
+    process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "./serviceAccountKey.json";
+  serviceAccount = JSON.parse(fs.readFileSync(serviceAccountPath, "utf8"));
+}
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
+
 
 // Verify token middleware (Authorization: Bearer <token>)
 async function verifyFirebaseToken(req, res, next) {
@@ -628,12 +643,21 @@ app.put(
   
 
 // -------------------- Start Server --------------------
-async function start() {
-  await connectMongo();
-  app.listen(port, () => console.log(`Server listening on port ${port}`));
-}
-
-start().catch((err) => {
-  console.error("Failed to start server:", err);
-  process.exit(1);
-});
+if (process.env.NODE_ENV !== 'production') {
+    // LOCAL DEVELOPMENT ONLY
+    async function start() {
+      await connectMongo();
+      app.listen(port, () => console.log(`Server listening on port ${port}`));
+    }
+  
+    start().catch((err) => {
+      console.error("Failed to start server:", err);
+      process.exit(1);
+    });
+  }
+  
+  // VERCEL SERVERLESS EXPORT
+  module.exports = app;
+  
+  
+  
