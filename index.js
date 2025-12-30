@@ -90,15 +90,34 @@ function now() {
 
 // Indexes supported via createIndex [web:531]
 async function ensureIndexes() {
-  const { offices, memberships, users } = cols();
-
-  await offices.createIndex({ createdByUid: 1 });
-  await memberships.createIndex({ userUid: 1 });
-  await memberships.createIndex({ officeId: 1, userUid: 1 }, { unique: true });
-
-  await users.createIndex({ uid: 1 }, { unique: true });
-  await users.createIndex({ email: 1 });
-}
+    const { offices, memberships, users } = cols();
+    const db = getDB();
+  
+    // Offices
+    await offices.createIndex({ createdByUid: 1 });
+  
+    // Memberships
+    await memberships.createIndex({ userUid: 1 });
+    await memberships.createIndex({ officeId: 1, userUid: 1 }, { unique: true });
+  
+    // Users
+    await users.createIndex({ uid: 1 }, { unique: true });
+    await users.createIndex({ email: 1 });
+  
+    // Projects (ADD THIS)
+    const projects = db.collection("projects");
+    await projects.createIndex({ officeId: 1 });
+    await projects.createIndex({ createdByUid: 1 });
+  
+    // Tasks (ADD THIS)
+    const tasks = db.collection("tasks");
+    await tasks.createIndex({ officeId: 1 });
+    await tasks.createIndex({ createdByUid: 1 });
+    await tasks.createIndex({ assignedTo: 1 });
+  
+    console.log("✅ All indexes created successfully");
+  }
+  
 
 // -------------------- Role Helpers --------------------
 function requireRole(allowedRoles = []) {
@@ -325,6 +344,288 @@ app.get(
     }
   }
 );
+
+/**
+ * POST /api/offices/:officeId/projects
+ * Body: { name, description?, status? }
+ */
+app.post(
+    "/api/offices/:officeId/projects",
+    verifyFirebaseToken,
+    requireRole(["CEO", "ADMIN", "MANAGER"]),
+    async (req, res) => {
+      try {
+        const { officeId } = req.params;
+        const { name, description, status } = req.body;
+  
+        if (!name) return res.status(400).json({ message: "Project name is required" });
+  
+        const officeObjectId = new ObjectId(officeId);
+        const db = getDB();
+        const projects = db.collection("projects");
+  
+        const doc = {
+          officeId: officeObjectId,
+          name: name.trim(),
+          description: description || "",
+          status: status || "PLANNING", // PLANNING | ACTIVE | COMPLETED | ON_HOLD
+          createdByUid: req.firebase.uid,
+          createdAt: now(),
+          updatedAt: now(),
+        };
+  
+        const result = await projects.insertOne(doc);
+        res.status(201).json({ message: "Project created", project: { ...doc, _id: result.insertedId } });
+      } catch (e) {
+        res.status(500).json({ message: e.message });
+      }
+    }
+  );
+  
+  /**
+   * GET /api/offices/:officeId/projects
+   */
+  app.get("/api/offices/:officeId/projects", verifyFirebaseToken, async (req, res) => {
+    try {
+      const { officeId } = req.params;
+      const officeObjectId = new ObjectId(officeId);
+  
+      const db = getDB();
+      const projects = db.collection("projects");
+  
+      const list = await projects.find({ officeId: officeObjectId }).sort({ createdAt: -1 }).toArray();
+      res.json({ projects: list });
+    } catch (e) {
+      res.status(500).json({ message: e.message });
+    }
+  });
+  
+  /**
+   * PUT /api/offices/:officeId/projects/:projectId
+   * Body: { name?, description?, status? }
+   */
+  app.put(
+    "/api/offices/:officeId/projects/:projectId",
+    verifyFirebaseToken,
+    requireRole(["CEO", "ADMIN", "MANAGER"]),
+    async (req, res) => {
+      try {
+        const { projectId } = req.params;
+        const { name, description, status } = req.body;
+  
+        const db = getDB();
+        const projects = db.collection("projects");
+  
+        const update = { updatedAt: now() };
+        if (name) update.name = name.trim();
+        if (description !== undefined) update.description = description;
+        if (status) update.status = status;
+  
+        const result = await projects.updateOne({ _id: new ObjectId(projectId) }, { $set: update });
+  
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ message: "Project not found" });
+        }
+  
+        res.json({ message: "Project updated" });
+      } catch (e) {
+        res.status(500).json({ message: e.message });
+      }
+    }
+  );
+  
+  /**
+   * DELETE /api/offices/:officeId/projects/:projectId
+   */
+  app.delete(
+    "/api/offices/:officeId/projects/:projectId",
+    verifyFirebaseToken,
+    requireRole(["CEO", "ADMIN", "MANAGER"]),
+    async (req, res) => {
+      try {
+        const { projectId } = req.params;
+  
+        const db = getDB();
+        const projects = db.collection("projects");
+  
+        const result = await projects.deleteOne({ _id: new ObjectId(projectId) });
+  
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ message: "Project not found" });
+        }
+  
+        res.json({ message: "Project deleted" });
+      } catch (e) {
+        res.status(500).json({ message: e.message });
+      }
+    }
+  );
+
+  
+  /**
+ * POST /api/offices/:officeId/tasks
+ * Body: { title, description?, status?, priority?, assignedTo? }
+ */
+app.post(
+    "/api/offices/:officeId/tasks",
+    verifyFirebaseToken,
+    requireRole(["CEO", "ADMIN", "MANAGER"]),
+    async (req, res) => {
+      try {
+        const { officeId } = req.params;
+        const { title, description, status, priority, assignedTo } = req.body;
+  
+        if (!title) return res.status(400).json({ message: "Task title is required" });
+  
+        const officeObjectId = new ObjectId(officeId);
+        const db = getDB();
+        const tasks = db.collection("tasks");
+  
+        const doc = {
+          officeId: officeObjectId,
+          title: title.trim(),
+          description: description || "",
+          status: status || "TODO", // TODO | IN_PROGRESS | DONE | BLOCKED
+          priority: priority || "MEDIUM", // LOW | MEDIUM | HIGH
+          assignedTo: assignedTo || null,
+          createdByUid: req.firebase.uid,
+          createdAt: now(),
+          updatedAt: now(),
+        };
+  
+        const result = await tasks.insertOne(doc);
+        res.status(201).json({ message: "Task created", task: { ...doc, _id: result.insertedId } });
+      } catch (e) {
+        res.status(500).json({ message: e.message });
+      }
+    }
+  );
+  
+  /**
+   * GET /api/offices/:officeId/tasks
+   */
+  app.get("/api/offices/:officeId/tasks", verifyFirebaseToken, async (req, res) => {
+    try {
+      const { officeId } = req.params;
+      const officeObjectId = new ObjectId(officeId);
+  
+      const db = getDB();
+      const tasks = db.collection("tasks");
+  
+      const list = await tasks.find({ officeId: officeObjectId }).sort({ createdAt: -1 }).toArray();
+      res.json({ tasks: list });
+    } catch (e) {
+      res.status(500).json({ message: e.message });
+    }
+  });
+  
+  /**
+   * PUT /api/offices/:officeId/tasks/:taskId
+   * Body: { title?, description?, status?, priority?, assignedTo? }
+   */
+  /**
+ * PUT /api/offices/:officeId/tasks/:taskId
+ * Body: { title?, description?, status?, priority?, assignedTo? }
+ * 
+ * NEW LOGIC:
+ * - CEO/ADMIN/MANAGER can update any task
+ * - EMPLOYEE can only update status of tasks assigned to them
+ */
+app.put(
+    "/api/offices/:officeId/tasks/:taskId",
+    verifyFirebaseToken,
+    async (req, res) => {
+      try {
+        const { taskId } = req.params;
+        const { title, description, status, priority, assignedTo } = req.body;
+  
+        const db = getDB();
+        const tasks = db.collection("tasks");
+  
+        // Get the task first
+        const task = await tasks.findOne({ _id: new ObjectId(taskId) });
+  
+        if (!task) {
+          return res.status(404).json({ message: "Task not found" });
+        }
+  
+        const userRole = req.firebase?.role || "EMPLOYEE";
+        const userEmail = req.firebase?.email;
+        const userUid = req.firebase?.uid;
+  
+        // Check permissions
+        const isManager = ["CEO", "ADMIN", "MANAGER"].includes(userRole);
+        const isAssignedToUser = task.assignedTo === userEmail || task.assignedTo === userUid;
+  
+        if (!isManager && !isAssignedToUser) {
+          return res.status(403).json({ 
+            message: "You can only update tasks assigned to you" 
+          });
+        }
+  
+        // Build update object
+        const update = { updatedAt: now() };
+  
+        // Employees can only update status
+        if (!isManager) {
+          if (status) update.status = status;
+          // Ignore other fields if employee tries to change them
+        } else {
+          // Managers can update everything
+          if (title) update.title = title.trim();
+          if (description !== undefined) update.description = description;
+          if (status) update.status = status;
+          if (priority) update.priority = priority;
+          if (assignedTo !== undefined) update.assignedTo = assignedTo;
+        }
+  
+        const result = await tasks.updateOne(
+          { _id: new ObjectId(taskId) }, 
+          { $set: update }
+        );
+  
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ message: "Task not found" });
+        }
+  
+        res.json({ 
+          message: "Task updated",
+          allowedFields: isManager ? "all" : "status only"
+        });
+      } catch (e) {
+        res.status(500).json({ message: e.message });
+      }
+    }
+  );
+  
+  
+  /**
+   * DELETE /api/offices/:officeId/tasks/:taskId
+   */
+  app.delete(
+    "/api/offices/:officeId/tasks/:taskId",
+    verifyFirebaseToken,
+    requireRole(["CEO", "ADMIN", "MANAGER"]),
+    async (req, res) => {
+      try {
+        const { taskId } = req.params;
+  
+        const db = getDB();
+        const tasks = db.collection("tasks");
+  
+        const result = await tasks.deleteOne({ _id: new ObjectId(taskId) });
+  
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ message: "Task not found" });
+        }
+  
+        res.json({ message: "Task deleted" });
+      } catch (e) {
+        res.status(500).json({ message: e.message });
+      }
+    }
+  );
+  
 
 // -------------------- Start Server --------------------
 async function start() {
