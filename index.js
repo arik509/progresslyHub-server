@@ -11,8 +11,23 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 5000;
 
-// Middlewares
-app.use(cors());
+// -------------------- Middleware --------------------
+app.use(cors({
+    origin: [
+      'http://localhost:5173',           // Local development
+      'http://localhost:5000',           // Local backend
+      'https://progressly-hub-server.vercel.app',  // Deployed backend
+      // Add your frontend Vercel URL when deployed:
+      // 'https://your-frontend-app.vercel.app'
+    ],
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+  }));
+  
+  app.use(express.json());
+  
+
 app.use(express.json());
 
 // -------------------- Firebase Admin Init --------------------
