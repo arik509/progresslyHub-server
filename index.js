@@ -38,7 +38,8 @@ app.use(
     origin: [
       "http://localhost:5173",
       "http://localhost:5000",
-    //   "https://progressly-hub-server.vercel.app",
+      "https://progressly-hub-server.vercel.app",
+      "https://progressly-hub-client.vercel.app"
       // Add your frontend Vercel URL when deployed
     ],
     credentials: true,
