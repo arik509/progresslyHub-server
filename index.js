@@ -2,7 +2,6 @@ const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const fs = require("fs");
-
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const admin = require("firebase-admin");
 
@@ -38,7 +37,7 @@ app.use(
     origin: [
       "http://localhost:5173",
       "http://localhost:5000",
-      "https://progressly-hub-client.vercel.app"
+      "https://progressly-hub-client.vercel.app",
     ],
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -53,7 +52,6 @@ let mongoClient = null;
 let db = null;
 
 async function connectMongo() {
-  // Reuse existing connection if available
   if (db && mongoClient) {
     try {
       await mongoClient.db("admin").command({ ping: 1 });
@@ -84,7 +82,6 @@ async function connectMongo() {
 
   db = mongoClient.db(process.env.MONGO_DB_NAME || "progresslyhub");
 
-  // Only ensure indexes once
   if (!db._indexesEnsured) {
     await ensureIndexes();
     db._indexesEnsured = true;
@@ -115,6 +112,7 @@ async function ensureIndexes() {
   const { offices, memberships, users } = cols();
   const db = getDB();
 
+  // Existing indexes...
   await offices.createIndex({ createdByUid: 1 });
   await memberships.createIndex({ userUid: 1 });
   await memberships.createIndex({ officeId: 1, userUid: 1 }, { unique: true });
@@ -130,8 +128,17 @@ async function ensureIndexes() {
   await tasks.createIndex({ createdByUid: 1 });
   await tasks.createIndex({ assignedTo: 1 });
 
+  // NEW: Personal mode indexes
+  const personalProjects = db.collection("personalProjects");
+  await personalProjects.createIndex({ userUid: 1 });
+
+  const personalTasks = db.collection("personalTasks");
+  await personalTasks.createIndex({ userUid: 1 });
+  await personalTasks.createIndex({ projectId: 1 });
+
   console.log("✅ All indexes created successfully");
 }
+
 
 // -------------------- Auth Middleware --------------------
 async function verifyFirebaseToken(req, res, next) {
@@ -633,6 +640,251 @@ app.delete(
     }
   }
 );
+
+
+// -------------------- Personal Mode Routes --------------------
+
+// Get or create personal workspace
+app.post("/api/personal/initialize", verifyFirebaseToken, async (req, res) => {
+  try {
+    await connectMongo();
+    const { users } = cols();
+    const uid = req.firebase.uid;
+    const email = req.firebase.email || null;
+
+    // Create/update user with personal mode
+    await users.updateOne(
+      { uid },
+      {
+        $set: { 
+          uid, 
+          email, 
+          mode: "PERSONAL",
+          updatedAt: now() 
+        },
+        $setOnInsert: { createdAt: now() },
+      },
+      { upsert: true }
+    );
+
+    // Set custom claims for personal mode
+    const claims = await mergeCustomClaims(uid, {
+      mode: "PERSONAL",
+      role: null,
+      officeId: null,
+    });
+
+    res.json({
+      message: "Personal mode initialized",
+      claims,
+    });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// -------------------- Personal Project Routes --------------------
+app.post("/api/personal/projects", verifyFirebaseToken, async (req, res) => {
+  try {
+    await connectMongo();
+    const { name, description, status } = req.body;
+
+    if (!name) return res.status(400).json({ message: "Project name is required" });
+
+    const db = getDB();
+    const projects = db.collection("personalProjects");
+
+    const doc = {
+      userUid: req.firebase.uid,
+      name: name.trim(),
+      description: description || "",
+      status: status || "PLANNING",
+      createdAt: now(),
+      updatedAt: now(),
+    };
+
+    const result = await projects.insertOne(doc);
+    res.status(201).json({
+      message: "Personal project created",
+      project: { ...doc, _id: result.insertedId },
+    });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.get("/api/personal/projects", verifyFirebaseToken, async (req, res) => {
+  try {
+    await connectMongo();
+    const db = getDB();
+    const projects = db.collection("personalProjects");
+
+    const list = await projects
+      .find({ userUid: req.firebase.uid })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.json({ projects: list });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.put("/api/personal/projects/:projectId", verifyFirebaseToken, async (req, res) => {
+  try {
+    await connectMongo();
+    const { projectId } = req.params;
+    const { name, description, status } = req.body;
+
+    const db = getDB();
+    const projects = db.collection("personalProjects");
+
+    const update = { updatedAt: now() };
+    if (name) update.name = name.trim();
+    if (description !== undefined) update.description = description;
+    if (status) update.status = status;
+
+    const result = await projects.updateOne(
+      { _id: new ObjectId(projectId), userUid: req.firebase.uid },
+      { $set: update }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ message: "Project not found" });
+    }
+
+    res.json({ message: "Project updated" });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.delete("/api/personal/projects/:projectId", verifyFirebaseToken, async (req, res) => {
+  try {
+    await connectMongo();
+    const { projectId } = req.params;
+
+    const db = getDB();
+    const projects = db.collection("personalProjects");
+
+    const result = await projects.deleteOne({
+      _id: new ObjectId(projectId),
+      userUid: req.firebase.uid,
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ message: "Project not found" });
+    }
+
+    res.json({ message: "Project deleted" });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// -------------------- Personal Task Routes --------------------
+app.post("/api/personal/tasks", verifyFirebaseToken, async (req, res) => {
+  try {
+    await connectMongo();
+    const { title, description, status, priority, projectId } = req.body;
+
+    if (!title) return res.status(400).json({ message: "Task title is required" });
+
+    const db = getDB();
+    const tasks = db.collection("personalTasks");
+
+    const doc = {
+      userUid: req.firebase.uid,
+      projectId: projectId ? new ObjectId(projectId) : null,
+      title: title.trim(),
+      description: description || "",
+      status: status || "TODO",
+      priority: priority || "MEDIUM",
+      createdAt: now(),
+      updatedAt: now(),
+    };
+
+    const result = await tasks.insertOne(doc);
+    res.status(201).json({
+      message: "Personal task created",
+      task: { ...doc, _id: result.insertedId },
+    });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.get("/api/personal/tasks", verifyFirebaseToken, async (req, res) => {
+  try {
+    await connectMongo();
+    const db = getDB();
+    const tasks = db.collection("personalTasks");
+
+    const list = await tasks
+      .find({ userUid: req.firebase.uid })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.json({ tasks: list });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.put("/api/personal/tasks/:taskId", verifyFirebaseToken, async (req, res) => {
+  try {
+    await connectMongo();
+    const { taskId } = req.params;
+    const { title, description, status, priority, projectId } = req.body;
+
+    const db = getDB();
+    const tasks = db.collection("personalTasks");
+
+    const update = { updatedAt: now() };
+    if (title) update.title = title.trim();
+    if (description !== undefined) update.description = description;
+    if (status) update.status = status;
+    if (priority) update.priority = priority;
+    if (projectId !== undefined) update.projectId = projectId ? new ObjectId(projectId) : null;
+
+    const result = await tasks.updateOne(
+      { _id: new ObjectId(taskId), userUid: req.firebase.uid },
+      { $set: update }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ message: "Task not found" });
+    }
+
+    res.json({ message: "Task updated" });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+app.delete("/api/personal/tasks/:taskId", verifyFirebaseToken, async (req, res) => {
+  try {
+    await connectMongo();
+    const { taskId } = req.params;
+
+    const db = getDB();
+    const tasks = db.collection("personalTasks");
+
+    const result = await tasks.deleteOne({
+      _id: new ObjectId(taskId),
+      userUid: req.firebase.uid,
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ message: "Task not found" });
+    }
+
+    res.json({ message: "Task deleted" });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
 
 // -------------------- Start Server --------------------
 if (process.env.NODE_ENV !== "production") {
