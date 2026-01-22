@@ -885,6 +885,50 @@ app.delete("/api/personal/tasks/:taskId", verifyFirebaseToken, async (req, res) 
   }
 });
 
+// -------------------- Team Mode Initialization --------------------
+app.post("/api/team/initialize", verifyFirebaseToken, async (req, res) => {
+  try {
+    await connectMongo();
+    const { memberships, offices } = cols();
+    const uid = req.firebase.uid;
+
+    // Find user's memberships
+    const userMemberships = await memberships.find({ userUid: uid }).toArray();
+
+    if (userMemberships.length === 0) {
+      return res.status(404).json({ 
+        message: "No office membership found. You need to create an office first." 
+      });
+    }
+
+    // Get the first (or most recent) office membership
+    const membership = userMemberships[0];
+    const officeId = membership.officeId.toString();
+    const role = membership.role || "EMPLOYEE";
+
+    // Update custom claims to Team mode
+    const claims = await mergeCustomClaims(uid, {
+      mode: "TEAM",
+      role: role,
+      officeId: officeId,
+    });
+
+    // Get office details
+    const office = await offices.findOne({ _id: membership.officeId });
+
+    res.json({
+      message: "Team mode initialized",
+      claims,
+      office,
+      role,
+      officeId,
+    });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+
 
 // -------------------- Start Server --------------------
 if (process.env.NODE_ENV !== "production") {
