@@ -36,7 +36,10 @@ app.use(
   cors({
     origin: [
       "http://localhost:5173",
+      "http://localhost:5174",
       "http://localhost:5000",
+      "http://127.0.0.1:5173",
+      "http://127.0.0.1:5174",
       "https://progressly-hub-client.vercel.app",
     ],
     credentials: true,
@@ -202,6 +205,36 @@ app.get("/api/db-test", async (req, res) => {
   }
 });
 
+// Get user profile with mode from MongoDB
+app.get("/api/user/profile", verifyFirebaseToken, async (req, res) => {
+  try {
+    await connectMongo();
+    const { users } = cols();
+    const uid = req.firebase.uid;
+
+    const userDoc = await users.findOne({ uid });
+
+    if (!userDoc) {
+      // User not in database yet - return default
+      return res.json({
+        uid,
+        email: req.firebase.email,
+        mode: null,
+        exists: false,
+      });
+    }
+
+    res.json({
+      uid: userDoc.uid,
+      email: userDoc.email,
+      mode: userDoc.mode || null,
+      exists: true,
+    });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
 // -------------------- Office Routes --------------------
 app.post("/api/offices", verifyFirebaseToken, async (req, res) => {
   try {
@@ -225,8 +258,11 @@ app.post("/api/offices", verifyFirebaseToken, async (req, res) => {
       { upsert: true }
     );
 
+    const inviteCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+
     const officeDoc = {
       name: name.trim(),
+      inviteCode,
       createdByUid: uid,
       createdAt: now(),
       updatedAt: now(),
@@ -249,11 +285,74 @@ app.post("/api/offices", verifyFirebaseToken, async (req, res) => {
       officeId: officeId.toString(),
     });
 
+    // Also include inviteCode in response
+    claims.inviteCode = inviteCode;
+
     res.status(201).json({
       message: "Office created",
       office: { ...officeDoc, _id: officeId },
       claims,
     });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Join an existing office via invite code
+app.post("/api/offices/join", verifyFirebaseToken, async (req, res) => {
+  try {
+    await connectMongo();
+    const { offices, memberships, users } = cols();
+    const { inviteCode } = req.body;
+    const uid = req.firebase.uid;
+    const email = req.firebase.email || null;
+
+    if (!inviteCode) {
+      return res.status(400).json({ message: "Invite code is required" });
+    }
+
+    const office = await offices.findOne({ inviteCode: inviteCode.toUpperCase() });
+    if (!office) {
+      return res.status(404).json({ message: "Invalid invite code" });
+    }
+
+    // Check if valid user doc exists
+    await users.updateOne(
+      { uid },
+      {
+        $set: { uid, email, updatedAt: now() },
+        $setOnInsert: { createdAt: now() },
+      },
+      { upsert: true }
+    );
+
+    // Check if already a member
+    const existingMember = await memberships.findOne({ officeId: office._id, userUid: uid });
+    if (existingMember) {
+      // Just refresh claims if needed
+      const claims = await mergeCustomClaims(uid, {
+        role: existingMember.role,
+        officeId: office._id.toString(),
+      });
+      return res.json({ message: "Already a member", officeId: office._id, claims });
+    }
+
+    // Add as EMPLOYEE by default
+    await memberships.insertOne({
+      officeId: office._id,
+      userUid: uid,
+      userEmail: email,
+      role: "EMPLOYEE",
+      createdAt: now(),
+      updatedAt: now(),
+    });
+
+    const claims = await mergeCustomClaims(uid, {
+      role: "EMPLOYEE",
+      officeId: office._id.toString(),
+    });
+
+    res.json({ message: "Joined office successfully", officeId: office._id, claims });
   } catch (e) {
     res.status(500).json({ message: e.message });
   }
@@ -377,7 +476,7 @@ app.post(
     try {
       await connectMongo();
       const { officeId } = req.params;
-      const { name, description, status } = req.body;
+      const { name, description, status, lead } = req.body;
 
       if (!name)
         return res.status(400).json({ message: "Project name is required" });
@@ -391,6 +490,7 @@ app.post(
         name: name.trim(),
         description: description || "",
         status: status || "PLANNING",
+        lead: lead || null,
         createdByUid: req.firebase.uid,
         createdAt: now(),
         updatedAt: now(),
@@ -438,7 +538,7 @@ app.put(
     try {
       await connectMongo();
       const { projectId } = req.params;
-      const { name, description, status } = req.body;
+      const { name, description, status, lead } = req.body;
 
       const db = getDB();
       const projects = db.collection("projects");
@@ -447,6 +547,7 @@ app.put(
       if (name) update.name = name.trim();
       if (description !== undefined) update.description = description;
       if (status) update.status = status;
+      if (lead !== undefined) update.lead = lead;
 
       const result = await projects.updateOne(
         { _id: new ObjectId(projectId) },
@@ -683,6 +784,55 @@ app.post("/api/personal/initialize", verifyFirebaseToken, async (req, res) => {
   }
 });
 
+// Initialize team mode
+app.post("/api/team/initialize", verifyFirebaseToken, async (req, res) => {
+  try {
+    await connectMongo();
+    const { users, memberships } = cols();
+    const uid = req.firebase.uid;
+    const email = req.firebase.email || null;
+
+    // Create/update user with team mode
+    await users.updateOne(
+      { uid },
+      {
+        $set: { 
+          uid, 
+          email, 
+          mode: "TEAM",
+          updatedAt: now() 
+        },
+        $setOnInsert: { createdAt: now() },
+      },
+      { upsert: true }
+    );
+
+    // Look up existing membership
+    const membership = await memberships.findOne({ userUid: uid });
+    let role = null;
+    let officeId = null;
+
+    if (membership) {
+        role = membership.role;
+        officeId = membership.officeId.toString();
+    }
+
+    // Set custom claims
+    const claims = await mergeCustomClaims(uid, {
+      mode: "TEAM",
+      role,
+      officeId,
+    });
+
+    res.json({
+      message: "Team mode initialized",
+      claims,
+    });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
 // -------------------- Personal Project Routes --------------------
 app.post("/api/personal/projects", verifyFirebaseToken, async (req, res) => {
   try {
@@ -885,48 +1035,7 @@ app.delete("/api/personal/tasks/:taskId", verifyFirebaseToken, async (req, res) 
   }
 });
 
-// -------------------- Team Mode Initialization --------------------
-app.post("/api/team/initialize", verifyFirebaseToken, async (req, res) => {
-  try {
-    await connectMongo();
-    const { memberships, offices } = cols();
-    const uid = req.firebase.uid;
 
-    // Find user's memberships
-    const userMemberships = await memberships.find({ userUid: uid }).toArray();
-
-    if (userMemberships.length === 0) {
-      return res.status(404).json({ 
-        message: "No office membership found. You need to create an office first." 
-      });
-    }
-
-    // Get the first (or most recent) office membership
-    const membership = userMemberships[0];
-    const officeId = membership.officeId.toString();
-    const role = membership.role || "EMPLOYEE";
-
-    // Update custom claims to Team mode
-    const claims = await mergeCustomClaims(uid, {
-      mode: "TEAM",
-      role: role,
-      officeId: officeId,
-    });
-
-    // Get office details
-    const office = await offices.findOne({ _id: membership.officeId });
-
-    res.json({
-      message: "Team mode initialized",
-      claims,
-      office,
-      role,
-      officeId,
-    });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
 
 
 
